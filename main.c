@@ -3,74 +3,37 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <fcntl.h>
-#include <sys/mman.h>
 #include <unistd.h>
 
-#define BASE_ADDRESS 0x43800000
-#define REGISTER_SIZE 0x10000
-#define READ_FIFO_OFFSET 0x0
-#define READ_FIFO_STATUS_OFFSET 0x4
-#define WRITE_FIFO_OFFSET 0x8
-#define WRITE_FIFO_STATUS_OFFSET 0xC
-
-#define IS_NOT_EMPTY 0
-#define IS_NOT_FULL 0
+#include <peripherals/mailbox_0.h>
 
 #define SLEEP_US 5000
 
-bool is_hardware_available(const char *node_label)
-{
-
-    char path[100];
-
-    snprintf(path, sizeof(path), "/proc/device-tree/%s/compatible", node_label);
-
-    FILE *file = fopen(path, "r");
-
-    if (NULL == file)
-    {
-        printf("Device %s does not exist in the device tree.\n", node_label);
-        return false;
-    }
-
-    char compatible_string[100];
-    fscanf(file, "%s", compatible_string);
-    printf("The device %s exists with compatible value: %s\n", node_label, compatible_string);
-    fclose(file);
-    return true;
-}
-
 int main(void)
 {
-
-    if (!is_hardware_available("mailbox_0"))
+    /* check if the hardware is available */
+    if (!peripherals_mailbox0_is_available())
     {
         fprintf(stderr, "Hardware isn't available.\n");
         exit(1);
     }
 
+    /* acquire a memory file descriptor with read and write */
     int mem_fd = open("/dev/mem", O_RDWR | O_SYNC);
     if (mem_fd == -1)
     {
         fprintf(stderr, "Can't open /dev/mem.\n");
-        return 1;
+        exit(1);
     }
-
-    void *mapped_base = mmap(0, REGISTER_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, mem_fd, BASE_ADDRESS);
-
-    if (mapped_base == MAP_FAILED)
+    /* create a mailbox instance and initialize it */
+    mailbox_t mailbox;
+    if (peripherals_mailbox0_init(&mailbox, mem_fd) != MAILBOX_OK)
     {
-        fprintf(stderr, "Mapping memory failed.\n");
-        close(mem_fd);
-        return 1;
+        fprintf(stderr, "The init of mailbox peripheral failed.\n");
+        exit(1);
     }
 
-    volatile int *read_fifo = (volatile int *)((char *)mapped_base + READ_FIFO_OFFSET);
-    volatile int *read_fifo_status = (volatile int *)((char *)mapped_base + READ_FIFO_STATUS_OFFSET);
-
-    volatile int *write_fifo = (volatile int *)((char *)mapped_base + WRITE_FIFO_OFFSET);
-    volatile int *write_fifo_status = (volatile int *)((char *)mapped_base + WRITE_FIFO_STATUS_OFFSET);
-
+    /* open the input and output file for testing feature */
     FILE *input_file = fopen("input_data.txt", "r");
     FILE *output_file = fopen("output_data.txt", "a");
 
@@ -80,40 +43,67 @@ int main(void)
         return 1;
     }
 
-    int values_to_read = 0;
+    /* main testing feature logic */
+    uint8_t values_to_read = 0;
     bool is_input_finished = false;
 
+    /* Run until every integer from input file has been written to hardware, processed and read.
+     * The loop polls read and write status registers with a 5 ms delay between each iteration.
+     *
+     *   -> is_input_finished checks if all of the integers have been read from the input file
+     *   -> values_to_read keeps track of how many integers have been written to hardware
+     */
     while ((is_input_finished == false) && (values_to_read == 0))
     {
-        if (*read_fifo_status == IS_NOT_EMPTY)
+        if (peripherals_mailbox0_is_read_empty(&mailbox) == false)
         {
-            fprintf(output_file, "%d\n", *read_fifo);
+            int32_t data;
+            if (peripherals_mailbox0_read_from_register(&mailbox, &data) != MAILBOX_OK)
+            {
+                fprintf(stderr, "Read from read FIFO failed.\n");
+                exit(1);
+            }
+            fprintf(output_file, "%d\n", data);
             values_to_read--;
         }
 
-        if ((*write_fifo_status == IS_NOT_FULL) && (is_input_finished == false))
+        if ((peripherals_mailbox0_is_write_full(&mailbox) == false) && (is_input_finished == false))
         {
-            int data;
-            if (fscanf(input_file, "%d", &data) != EOF)
-            {
+            int32_t data;
 
-                *write_fifo = data;
+            uint8_t fscanf_status = fscanf(input_file, "%d", &data);
+
+            if (fscanf_status == 1)
+            {
+                if (peripherals_mailbox0_write_to_register(&mailbox, data) != MAILBOX_OK)
+                {
+                    fprintf(stderr, "Write to write FIFO failed.\n");
+                    exit(1);
+                }
                 values_to_read++;
+            }
+            else if (fscanf_status == EOF)
+            {
+                is_input_finished = true;
             }
             else
             {
-                is_input_finished = true;
+                fprintf(stderr, "Function fscanf couldn't read one integer. Moving on...\n");
             }
         }
         usleep(SLEEP_US);
     }
 
+    /* close all open files */
     fclose(input_file);
     fclose(output_file);
 
-    // Unmap memory and close file descriptors
-    munmap(mapped_base, REGISTER_SIZE);
-    close(mem_fd);
+    /* deinit mailbox and memory file descriptor */
+    if (peripherals_mailbox0_deinit(&mailbox, mem_fd) != MAILBOX_OK)
+    {
+        fprintf(stderr, "Deinit of mailbox failed.\n");
+        exit(1);
+    }
 
     return 0;
 }
